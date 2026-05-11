@@ -39,6 +39,7 @@
 #include "../views/color_view.hpp"
 #include "../views/depth_view.hpp"
 #include "../views/fanout_view.hpp"
+#include "../views/topo_view.hpp"
 #include "../views/window_view.hpp"
 #include "cleanup.hpp"
 #include "cut_enumeration.hpp"
@@ -130,24 +131,11 @@ public:
   rewrite_impl( Ntk& ntk, Library&& library, rewrite_params const& ps, rewrite_stats& st, NodeCostFn const& cost_fn )
       : ntk( ntk ), library( library ), ps( ps ), st( st ), cost_fn( cost_fn ), required( ntk, UINT32_MAX )
   {
-    register_events();
-  }
-
-  ~rewrite_impl()
-  {
-    if constexpr ( has_level_v<Ntk> )
-    {
-      ntk.events().release_add_event( add_event );
-      ntk.events().release_modified_event( modified_event );
-      ntk.events().release_delete_event( delete_event );
-    }
   }
 
   void run()
   {
     stopwatch t( st.time_total );
-
-    ntk.incr_trav_id();
 
     if ( ps.preserve_depth )
     {
@@ -195,12 +183,7 @@ private:
       {
         if ( ps.preserve_depth )
         {
-          uint32_t level = 0;
-          ntk.foreach_fanin( n, [&]( auto const& f ) {
-            level = std::max( level, ntk.level( ntk.get_node( f ) ) );
-          } );
-          ntk.set_level( n, level + 1 );
-          best_level = level + 1;
+          best_level = ntk.level( n );
         }
       }
 
@@ -323,8 +306,9 @@ private:
           /* propagate new required to leaves */
           if ( ps.preserve_depth )
           {
-            propagate_required_rec( ntk.node_to_index( n ), ntk.get_node( new_f ), size, required[n] );
+            propagate_required( ntk.get_node( new_f ), required[n] );
             assert( ntk.level( ntk.get_node( new_f ) ) <= required[n] );
+            update_levels( ntk.get_node( new_f ) );
           }
         }
 
@@ -377,12 +361,7 @@ private:
       {
         if ( ps.preserve_depth )
         {
-          uint32_t level = 0;
-          ntk.foreach_fanin( n, [&]( auto const& f ) {
-            level = std::max( level, ntk.level( ntk.get_node( f ) ) );
-          } );
-          ntk.set_level( n, level + 1 );
-          best_level = level + 1;
+          best_level = ntk.level( n );
         }
       }
 
@@ -549,8 +528,9 @@ private:
           /* propagate new required to leaves */
           if ( ps.preserve_depth )
           {
-            propagate_required_rec( ntk.node_to_index( n ), ntk.get_node( new_f ), size, required[n] );
+            propagate_required( ntk.get_node( new_f ), required[n] );
             assert( ntk.level( ntk.get_node( new_f ) ) <= required[n] );
+            update_levels( ntk.get_node( new_f ) );
           }
         }
 
@@ -769,35 +749,39 @@ private:
         required[f] = ntk.depth();
       } );
 
-      for ( uint32_t index = ntk.size() - 1; index > ntk.num_pis(); index-- )
-      {
-        node<Ntk> n = ntk.index_to_node( index );
-        uint32_t req = required[n];
+      topo_view<Ntk, false> topo{ ntk };
+
+      topo.foreach_node_reverse( [&]( auto const& n ) {
+        if ( ntk.is_constant( n ) || ntk.is_pi( n ) || required[n] == UINT32_MAX )
+          return;
 
         ntk.foreach_fanin( n, [&]( auto const& f ) {
-          required[f] = std::min( required[f], req - 1 );
+          required[f] = std::min( required[f], ntk.compute_fanin_required( n, f, required[n] ) );
         } );
-      }
+      } );
     }
   }
 
-  void propagate_required_rec( uint32_t root, node<Ntk> const& n, uint32_t size, uint32_t req )
+  void propagate_required_rec( node<Ntk> const& n, uint32_t req )
   {
     if ( ntk.is_constant( n ) || ntk.is_pi( n ) )
       return;
 
-    /* recursively update required time */
+    if ( required[n] <= req )
+      return;
+
+    required[n] = req;
+
     ntk.foreach_fanin( n, [&]( auto const& f ) {
       auto const g = ntk.get_node( f );
-
-      /* recur if it is still a node to explore and to update */
-      if ( ntk.node_to_index( g ) > root && ( ntk.node_to_index( g ) >= size || required[g] >= req ) )
-        propagate_required_rec( root, g, size, req - 1 );
-
-      /* update the required time */
-      if ( ntk.node_to_index( g ) < size )
-        required[g] = std::min( required[g], req - 1 );
+      propagate_required_rec( g, ntk.compute_fanin_required( n, f, req ) );
     } );
+  }
+
+  void propagate_required( node<Ntk> const& n, uint32_t req )
+  {
+    required.resize( UINT32_MAX );
+    propagate_required_rec( n, req );
   }
 
   void clear_cuts_fanout_rec( network_cuts_t& cuts, cut_manager_t& cut_manager, node<Ntk> const& n )
@@ -813,62 +797,142 @@ private:
   }
 
 private:
-  void register_events()
+  void update_levels( node<Ntk> const& n )
   {
-    if constexpr ( has_level_v<Ntk> )
+    /*
+    ntk.foreach_fanout( n, [&]( const auto& p ) {
+      update_levels_naive( p );
+    } );
+    return;
+    */
+
+    ntk.incr_trav_id();
+    auto const mark = ntk.trav_id();
+    std::vector<node<Ntk>> deferred;
+
+    ntk.foreach_fanout( n, [&]( const auto& p ) {
+      update_levels_fast( p, mark, deferred );
+    } );
+
+    if ( deferred.empty() )
+      return;
+
+    ntk.incr_trav_id();
+    auto const mark2 = ntk.trav_id();
+    std::vector<node<Ntk>> sinks;
+
+    for ( auto const& p : deferred )
+      mark_tfo( p, mark2, sinks );
+
+    ntk.incr_trav_id();
+    auto const mark3 = ntk.trav_id();
+    std::vector<node<Ntk>> tfi_topo;
+
+    for ( auto const& p : sinks )
+      collect_marked_tfi_topo( p, mark2, mark3, tfi_topo );
+
+    sinks.clear();
+
+    ntk.incr_trav_id();
+    auto const mark4 = ntk.trav_id();
+    for ( auto const& p : deferred )
+      ntk.set_visited( p, mark4 );
+
+    for ( auto const& p : tfi_topo )
     {
-      auto const update_level_of_new_node = [&]( const auto& n ) {
-        ntk.resize_levels();
-        update_node_level( n );
-      };
+      if ( ntk.visited( p ) != mark4 )
+        continue;
 
-      auto const update_level_of_existing_node = [&]( node<Ntk> const& n, const auto& old_children ) {
-        (void)old_children;
-        ntk.resize_levels();
-        update_node_level( n );
-      };
-
-      auto const update_level_of_deleted_node = [&]( node<Ntk> const& n ) {
-        ntk.set_level( n, -1 );
-      };
-
-      add_event = ntk.events().register_add_event( update_level_of_new_node );
-      modified_event = ntk.events().register_modified_event( update_level_of_existing_node );
-      delete_event = ntk.events().register_delete_event( update_level_of_deleted_node );
+      if ( update_level( p ) )
+      {
+        ntk.foreach_fanout( p, [&]( const auto& q ) {
+          ntk.set_visited( q, mark4 );
+        } );
+      }
     }
   }
 
-  /* maybe it should be moved to depth_view */
-  void update_node_level( node<Ntk> const& n, bool top_most = true )
+  /*
+  void update_levels_naive( node<Ntk> const& n )
+  {
+    if ( update_level( n ) )
+    {
+      ntk.foreach_fanout( n, [&]( auto const& fo ) {
+        update_levels_naive( fo );
+      } );
+    }
+  }
+  */
+
+  void update_levels_fast( node<Ntk> const& n, uint32_t mark, std::vector<node<Ntk>>& deferred )
+  {
+    if ( ntk.visited( n ) == mark )
+    {
+      if constexpr ( has_level_v<Ntk> )
+      {
+        if ( ntk.level( n ) != ntk.compute_level( n ) )
+          deferred.push_back( n );
+      }
+      return;
+    }
+
+    ntk.set_visited( n, mark );
+
+    if ( update_level( n ) )
+    {
+      ntk.foreach_fanout( n, [&]( auto const& fo ) {
+        update_levels_fast( fo, mark, deferred );
+      } );
+    }
+  }
+
+  bool update_level( node<Ntk> const& n )
   {
     if constexpr ( has_level_v<Ntk> )
     {
-      uint32_t curr_level = ntk.level( n );
-
-      uint32_t max_level = 0;
-      ntk.foreach_fanin( n, [&]( const auto& f ) {
-        auto const p = ntk.get_node( f );
-        auto const fanin_level = ntk.level( p );
-        if ( fanin_level > max_level )
-        {
-          max_level = fanin_level;
-        }
-      } );
-      ++max_level;
-
-      if ( curr_level != max_level )
+      uint32_t level = ntk.compute_level( n );
+      if ( ntk.level( n ) != level )
       {
-        ntk.set_level( n, max_level );
-
-        /* update only one more level */
-        if ( top_most )
-        {
-          ntk.foreach_fanout( n, [&]( const auto& p ) {
-            update_node_level( p, false );
-          } );
-        }
+        ntk.set_level( n, level );
+        return true;
       }
     }
+    return false;
+  }
+
+  void mark_tfo( node<Ntk> const& n, uint32_t mark, std::vector<node<Ntk>>& sinks )
+  {
+    if ( ntk.visited( n ) == mark )
+      return;
+
+    ntk.set_visited( n, mark );
+
+    bool f = false;
+    ntk.foreach_fanout( n, [&]( auto const& fo ) {
+      mark_tfo( fo, mark, sinks );
+      f = true;
+    } );
+
+    if ( !f )
+      sinks.push_back( n );
+  }
+
+  void collect_marked_tfi_topo( node<Ntk> const& n, uint32_t mark, uint32_t visited, std::vector<node<Ntk>>& tfi_topo )
+  {
+    if ( ntk.visited( n ) == visited )
+      return;
+
+    if ( ntk.visited( n ) != mark )
+      return;
+
+    ntk.set_visited( n, visited );
+
+    ntk.foreach_fanin( n, [&]( auto const& f ) {
+      auto const p = ntk.get_node( f );
+      collect_marked_tfi_topo( p, mark, visited, tfi_topo );
+    } );
+
+    tfi_topo.push_back( n );
   }
 
 private:
@@ -882,11 +946,6 @@ private:
 
   uint32_t _candidates{ 0 };
   uint32_t _estimated_gain{ 0 };
-
-  /* events */
-  std::shared_ptr<typename network_events<Ntk>::add_event_type> add_event;
-  std::shared_ptr<typename network_events<Ntk>::modified_event_type> modified_event;
-  std::shared_ptr<typename network_events<Ntk>::delete_event_type> delete_event;
 };
 
 } /* namespace detail */
